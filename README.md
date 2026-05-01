@@ -4,16 +4,18 @@ Shared authentication package for Newsquawk services using JWT/JWKS token valida
 
 ## Installation
 
-From another service, install this package using pipenv:
+Install this package directly from the public git repository, pinned to release `v0.0.1`.
+
+Using pipenv:
 
 ```bash
-pipenv install -e ../packages/newsquawk-auth
+pipenv install git+https://github.com/newsquawk/kc-fastapi-auth.git@v0.0.1#egg=newsquawk-auth
 ```
 
 Or with pip:
 
 ```bash
-pip install -e ../packages/newsquawk-auth
+pip install git+https://github.com/newsquawk/kc-fastapi-auth.git@v0.0.1
 ```
 
 ## Usage

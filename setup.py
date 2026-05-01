@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="newsquawk-auth",
-    version="0.1.0",
+    version="0.0.1",
     description="Shared authentication package for Newsquawk services using JWT/JWKS",
     packages=find_packages(),
     python_requires=">=3.10",
