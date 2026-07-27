@@ -33,19 +33,23 @@ class AuthService:
         Args:
             jwks_url: URL to the JWKS endpoint (e.g., Keycloak certs endpoint).
                 Required unless dev_mode is True.
-            audience: Expected audience claim in the JWT token. Required unless
-                dev_mode is True (defaults to "dev-client" in dev mode).
+            audience: Expected audience (aud) claim in the JWT token. Optional.
+                When set, the token's aud claim must be present and match. When
+                None (and not in dev mode), audience validation is disabled
+                entirely — signature and expiry are still verified. Defaults to
+                "dev-client" in dev mode.
             algorithms: List of allowed signing algorithms (default: ["RS256"])
             custom_headers: Optional custom headers for JWKS client requests
             dev_mode: If True, JWT signatures are NOT verified. Instead, the
                 bearer token is looked up in dev_users to resolve a stub user.
                 NEVER enable this in production.
             dev_users: Mapping of bearer-token string -> stub user spec. Each
-                spec may contain "user_id"/"sub", "username", "email", "roles"
-                (a list), and an optional "claims" dict for extra/raw claims.
-                Only used when dev_mode is True. If omitted/empty, token
-                verification is skipped entirely and any token (including none)
-                resolves to a default stub user.
+                spec may contain "user_id"/"sub", "username", "email",
+                "realm_roles" (a list), "client_roles" (a dict of
+                client -> list of roles), and an optional "claims" dict for
+                extra/raw claims. Only used when dev_mode is True. If
+                omitted/empty, token verification is skipped entirely and any
+                token (including none) resolves to a default stub user.
         """
         self.jwks_url = jwks_url
         self.audience = audience
@@ -63,9 +67,14 @@ class AuthService:
             )
             return
 
-        if not jwks_url or not audience:
-            raise ValueError(
-                "jwks_url and audience are required when dev_mode is False"
+        if not jwks_url:
+            raise ValueError("jwks_url is required when dev_mode is False")
+
+        if not audience:
+            logger.warning(
+                "AuthService initialized without an audience — the token 'aud' "
+                "claim will NOT be validated. Signature and expiry are still "
+                "verified."
             )
 
         # Initialize PyJWKClient with optional custom headers
@@ -84,16 +93,29 @@ class AuthService:
         """
         Build decoded-token claims from a stub user spec.
 
-        Roles are nested under resource_access[audience][roles] so that
-        extract_roles works identically to a real Keycloak token.
+        Realm roles are nested under realm_access[roles] and client roles under
+        resource_access[client][roles], mirroring a real Keycloak token so the
+        extract_* / verify_* methods work identically.
+
+        Spec keys:
+            user_id / sub, username, email
+            realm_roles: list[str] -> realm_access.roles
+            client_roles: dict[client -> list[str]] -> resource_access[client].roles
+            claims: dict of extra/raw claims merged in last
         """
-        roles = spec.get("roles", [])
         claims: Dict[str, Any] = {
             "sub": spec.get("user_id") or spec.get("sub") or spec.get("username", "dev-user"),
             "preferred_username": spec.get("username"),
             "email": spec.get("email"),
-            "resource_access": {self.audience: {"roles": roles}},
         }
+        realm_roles = spec.get("realm_roles")
+        if realm_roles:
+            claims["realm_access"] = {"roles": list(realm_roles)}
+        client_roles = spec.get("client_roles")
+        if client_roles:
+            claims["resource_access"] = {
+                client: {"roles": list(roles)} for client, roles in client_roles.items()
+            }
         # Allow arbitrary extra/raw claims to be merged in or override defaults.
         claims.update(spec.get("claims", {}))
         return claims
@@ -138,13 +160,18 @@ class AuthService:
             # Get the signing key from the JWKS endpoint
             signing_key = self.jwks_client.get_signing_key_from_jwt(token)
 
-            # Decode and verify the token
+            # Decode and verify the token. Audience is validated only when an
+            # audience was configured; otherwise verify_aud is disabled so that
+            # tokens carrying an aud claim are not rejected outright.
             decoded_token = jwt.decode(
                 token,
                 signing_key.key,
                 algorithms=self.algorithms,
                 audience=self.audience,
-                options={"verify_exp": True},
+                options={
+                    "verify_exp": True,
+                    "verify_aud": self.audience is not None,
+                },
             )
 
             return decoded_token
@@ -178,54 +205,109 @@ class AuthService:
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-    def extract_roles(self, token_data: Dict[str, Any]) -> list[str]:
+    def extract_client_roles(self, token_data: Dict[str, Any], client: str) -> list[str]:
         """
-        Extract user roles from the decoded token.
+        Extract a specific client's roles from the decoded token.
 
-        This method handles the Keycloak token structure where roles are stored
-        in token_data["resource_access"][audience]["roles"].
+        Reads token_data["resource_access"][client]["roles"]. The client is
+        chosen explicitly by the caller and is independent of the token
+        audience (which is only used to validate the ``aud`` claim).
 
         Args:
             token_data: Decoded JWT token claims
+            client: Keycloak client ID whose roles to read (e.g.
+                "mobile-notifications")
 
         Returns:
-            List of role strings assigned to the user
+            List of client role strings assigned to the user
         """
         try:
             resource_access = token_data.get("resource_access", {})
-            client_access = resource_access.get(self.audience, {})
-            roles = client_access.get("roles", [])
-            return roles
+            client_access = resource_access.get(client, {})
+            return client_access.get("roles", [])
         except (KeyError, TypeError, AttributeError):
-            logger.warning("Unable to extract roles from token")
+            logger.warning(f"Unable to extract client roles for '{client}' from token")
             return []
 
-    def verify_role(self, token_data: Dict[str, Any], required_role: str) -> bool:
+    def extract_realm_roles(self, token_data: Dict[str, Any]) -> list[str]:
         """
-        Check if the user has a specific role.
+        Extract realm-level roles from the decoded token.
+
+        Reads token_data["realm_access"]["roles"].
 
         Args:
             token_data: Decoded JWT token claims
+
+        Returns:
+            List of realm role strings assigned to the user
+        """
+        try:
+            realm_access = token_data.get("realm_access", {})
+            return realm_access.get("roles", [])
+        except (KeyError, TypeError, AttributeError):
+            logger.warning("Unable to extract realm roles from token")
+            return []
+
+    def verify_client_role(
+        self, token_data: Dict[str, Any], client: str, required_role: str
+    ) -> bool:
+        """
+        Check if the user has a specific role on a specific client.
+
+        Args:
+            token_data: Decoded JWT token claims
+            client: Keycloak client ID to check roles against
             required_role: The role name to check for
 
         Returns:
-            True if user has the role, False otherwise
+            True if user has the client role, False otherwise
         """
-        user_roles = self.extract_roles(token_data)
-        return required_role in user_roles
+        return required_role in self.extract_client_roles(token_data, client)
 
-    def verify_any_role(self, token_data: Dict[str, Any], allowed_roles: list[str]) -> bool:
+    def verify_any_client_role(
+        self, token_data: Dict[str, Any], client: str, allowed_roles: list[str]
+    ) -> bool:
         """
-        Check if the user has any of the specified roles.
+        Check if the user has any of the specified roles on a specific client.
 
         Args:
             token_data: Decoded JWT token claims
+            client: Keycloak client ID to check roles against
             allowed_roles: List of acceptable role names
 
         Returns:
-            True if user has at least one of the roles, False otherwise
+            True if user has at least one of the client roles, False otherwise
         """
-        user_roles = self.extract_roles(token_data)
+        user_roles = self.extract_client_roles(token_data, client)
+        return any(role in user_roles for role in allowed_roles)
+
+    def verify_realm_role(self, token_data: Dict[str, Any], required_role: str) -> bool:
+        """
+        Check if the user has a specific realm-level role.
+
+        Args:
+            token_data: Decoded JWT token claims
+            required_role: The realm role name to check for
+
+        Returns:
+            True if user has the realm role, False otherwise
+        """
+        return required_role in self.extract_realm_roles(token_data)
+
+    def verify_any_realm_role(
+        self, token_data: Dict[str, Any], allowed_roles: list[str]
+    ) -> bool:
+        """
+        Check if the user has any of the specified realm-level roles.
+
+        Args:
+            token_data: Decoded JWT token claims
+            allowed_roles: List of acceptable realm role names
+
+        Returns:
+            True if user has at least one of the realm roles, False otherwise
+        """
+        user_roles = self.extract_realm_roles(token_data)
         return any(role in user_roles for role in allowed_roles)
 
     def extract_user_id(self, token_data: Dict[str, Any]) -> Optional[str]:

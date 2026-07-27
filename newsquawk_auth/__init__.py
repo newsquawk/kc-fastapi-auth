@@ -9,9 +9,10 @@ from newsquawk_auth.deps import (
     # Convenience functions that accept AuthService directly
     get_token_data,
     get_current_user,
-    has_role,
-    has_any_role,
-    require_internal_or_external,
+    has_client_role,
+    has_any_client_role,
+    has_realm_role,
+    has_any_realm_role,
 )
 
 __version__ = "0.1.0"
@@ -25,7 +26,8 @@ __all__ = [
     # Convenience functions
     "get_token_data",
     "get_current_user",
-    "has_role",
-    "has_any_role",
-    "require_internal_or_external",
+    "has_client_role",
+    "has_any_client_role",
+    "has_realm_role",
+    "has_any_realm_role",
 ]

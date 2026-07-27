@@ -64,22 +64,34 @@ class CurrentUser:
         return self._auth_service.extract_email(self._token_data)
 
     @property
-    def roles(self) -> list[str]:
-        """List of user's roles."""
-        return self._auth_service.extract_roles(self._token_data)
+    def realm_roles(self) -> list[str]:
+        """List of the user's realm-level roles."""
+        return self._auth_service.extract_realm_roles(self._token_data)
+
+    def client_roles(self, client: str) -> list[str]:
+        """List of the user's roles on a specific client."""
+        return self._auth_service.extract_client_roles(self._token_data, client)
 
     @property
     def token_data(self) -> Dict[str, Any]:
         """Raw decoded token data for custom claim access."""
         return self._token_data
 
-    def has_role(self, role: str) -> bool:
-        """Check if user has a specific role."""
-        return self._auth_service.verify_role(self._token_data, role)
+    def has_realm_role(self, role: str) -> bool:
+        """Check if user has a specific realm-level role."""
+        return self._auth_service.verify_realm_role(self._token_data, role)
 
-    def has_any_role(self, roles: list[str]) -> bool:
-        """Check if user has any of the specified roles."""
-        return self._auth_service.verify_any_role(self._token_data, roles)
+    def has_any_realm_role(self, roles: list[str]) -> bool:
+        """Check if user has any of the specified realm-level roles."""
+        return self._auth_service.verify_any_realm_role(self._token_data, roles)
+
+    def has_client_role(self, client: str, role: str) -> bool:
+        """Check if user has a specific role on a specific client."""
+        return self._auth_service.verify_client_role(self._token_data, client, role)
+
+    def has_any_client_role(self, client: str, roles: list[str]) -> bool:
+        """Check if user has any of the specified roles on a specific client."""
+        return self._auth_service.verify_any_client_role(self._token_data, client, roles)
 
     def __repr__(self) -> str:
         return f"CurrentUser(user_id={self.user_id}, username={self.username})"
@@ -109,8 +121,14 @@ class AuthDependencies:
         ):
             return {"user_id": user.user_id}
 
+        @app.get("/notifications")
+        async def notifications_route(
+            _: Annotated[None, Depends(auth_deps.has_client_role("mobile-notifications", "subscriber"))]
+        ):
+            return {"message": "Subscriber access granted"}
+
         @app.get("/admin")
-        async def admin_route(_: Annotated[None, Depends(auth_deps.has_role("admin"))]):
+        async def admin_route(_: Annotated[None, Depends(auth_deps.has_realm_role("admin"))]):
             return {"message": "Admin access granted"}
     """
 
@@ -158,85 +176,130 @@ class AuthDependencies:
 
         return _get_current_user
 
-    def has_role(self, required_role: str) -> Callable:
+    def has_client_role(self, client: str, required_role: str) -> Callable:
         """
-        Create a dependency that requires a specific role.
+        Create a dependency that requires a specific role on a specific client.
+
+        The client is chosen explicitly by the caller and is independent of the
+        token audience.
 
         Args:
-            required_role: The role name that the user must have
+            client: Keycloak client ID whose roles to check (e.g.
+                "mobile-notifications")
+            required_role: The role name that the user must have on that client
 
         Returns:
-            Async dependency function that checks for the role
+            Async dependency function that checks for the client role
 
         Raises:
-            HTTPException: 403 if user doesn't have the required role
+            HTTPException: 403 if user doesn't have the required client role
         """
         auth_service = self.auth_service
         _get_token_data = self.get_token_data()
 
-        async def _check_role(
+        async def _check_client_role(
             token_data: Annotated[Dict[str, Any], Depends(_get_token_data)],
         ) -> None:
-            """Check if user has the required role."""
-            if not auth_service.verify_role(token_data, required_role):
+            """Check if user has the required client role."""
+            if not auth_service.verify_client_role(token_data, client, required_role):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Missing required role: {required_role}",
+                    detail=f"Missing required role '{required_role}' for client '{client}'",
                 )
 
-        return _check_role
+        return _check_client_role
 
-    def has_any_role(self, allowed_roles: list[str]) -> Callable:
+    def has_any_client_role(self, client: str, allowed_roles: list[str]) -> Callable:
         """
-        Create a dependency that requires any of the specified roles.
+        Create a dependency that requires any of the given roles on a client.
 
         Args:
-            allowed_roles: List of acceptable role names
+            client: Keycloak client ID whose roles to check
+            allowed_roles: List of acceptable role names on that client
 
         Returns:
-            Async dependency function that returns user's roles
+            Async dependency function that returns the user's client roles
 
         Raises:
-            HTTPException: 403 if user doesn't have any of the allowed roles
+            HTTPException: 403 if user has none of the allowed client roles
         """
         auth_service = self.auth_service
         _get_token_data = self.get_token_data()
 
-        async def _check_roles(
+        async def _check_client_roles(
             token_data: Annotated[Dict[str, Any], Depends(_get_token_data)],
         ) -> list[str]:
-            """Check if user has any of the allowed roles."""
-            user_roles = auth_service.extract_roles(token_data)
-
-            if not auth_service.verify_any_role(token_data, allowed_roles):
+            """Check if user has any of the allowed client roles."""
+            if not auth_service.verify_any_client_role(token_data, client, allowed_roles):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Missing required roles. Need one of: {', '.join(allowed_roles)}",
+                    detail=(
+                        f"Missing required roles for client '{client}'. "
+                        f"Need one of: {', '.join(allowed_roles)}"
+                    ),
                 )
 
-            return user_roles
+            return auth_service.extract_client_roles(token_data, client)
 
-        return _check_roles
+        return _check_client_roles
 
-    def require_internal_or_external(self) -> Callable:
+    def has_realm_role(self, required_role: str) -> Callable:
         """
-        Create a dependency that checks for internal or external access.
+        Create a dependency that requires a specific realm-level role.
+
+        Args:
+            required_role: The realm role name that the user must have
 
         Returns:
-            Async dependency function that returns True for internal, False for external
+            Async dependency function that checks for the realm role
 
         Raises:
-            HTTPException: 403 if user has neither access-internal nor access-external role
+            HTTPException: 403 if user doesn't have the required realm role
         """
-        _check_roles = self.has_any_role(["access-internal", "access-external"])
+        auth_service = self.auth_service
+        _get_token_data = self.get_token_data()
 
-        async def _require_internal_or_external(
-            roles: Annotated[list[str], Depends(_check_roles)]
-        ) -> bool:
-            """Check if user has internal or external access."""
-            return "access-internal" in roles
+        async def _check_realm_role(
+            token_data: Annotated[Dict[str, Any], Depends(_get_token_data)],
+        ) -> None:
+            """Check if user has the required realm role."""
+            if not auth_service.verify_realm_role(token_data, required_role):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Missing required realm role: {required_role}",
+                )
 
-        return _require_internal_or_external
+        return _check_realm_role
+
+    def has_any_realm_role(self, allowed_roles: list[str]) -> Callable:
+        """
+        Create a dependency that requires any of the given realm-level roles.
+
+        Args:
+            allowed_roles: List of acceptable realm role names
+
+        Returns:
+            Async dependency function that returns the user's realm roles
+
+        Raises:
+            HTTPException: 403 if user has none of the allowed realm roles
+        """
+        auth_service = self.auth_service
+        _get_token_data = self.get_token_data()
+
+        async def _check_realm_roles(
+            token_data: Annotated[Dict[str, Any], Depends(_get_token_data)],
+        ) -> list[str]:
+            """Check if user has any of the allowed realm roles."""
+            if not auth_service.verify_any_realm_role(token_data, allowed_roles):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Missing required realm roles. Need one of: {', '.join(allowed_roles)}",
+                )
+
+            return auth_service.extract_realm_roles(token_data)
+
+        return _check_realm_roles
 
 
 # Convenience functions for backward compatibility and simpler usage
@@ -266,42 +329,63 @@ def get_current_user(auth_service: AuthService) -> Callable:
     return AuthDependencies(auth_service).get_current_user()
 
 
-def has_role(auth_service: AuthService, required_role: str) -> Callable:
+def has_client_role(
+    auth_service: AuthService, client: str, required_role: str
+) -> Callable:
     """
-    Create a role check dependency for the given AuthService.
+    Create a client-role check dependency for the given AuthService.
 
     Args:
         auth_service: Configured AuthService instance
-        required_role: The role name that the user must have
+        client: Keycloak client ID whose roles to check
+        required_role: The role name that the user must have on that client
 
     Returns:
         Async dependency function
     """
-    return AuthDependencies(auth_service).has_role(required_role)
+    return AuthDependencies(auth_service).has_client_role(client, required_role)
 
 
-def has_any_role(auth_service: AuthService, allowed_roles: list[str]) -> Callable:
+def has_any_client_role(
+    auth_service: AuthService, client: str, allowed_roles: list[str]
+) -> Callable:
     """
-    Create a multi-role check dependency for the given AuthService.
+    Create a multi-client-role check dependency for the given AuthService.
 
     Args:
         auth_service: Configured AuthService instance
-        allowed_roles: List of acceptable role names
+        client: Keycloak client ID whose roles to check
+        allowed_roles: List of acceptable role names on that client
 
     Returns:
         Async dependency function
     """
-    return AuthDependencies(auth_service).has_any_role(allowed_roles)
+    return AuthDependencies(auth_service).has_any_client_role(client, allowed_roles)
 
 
-def require_internal_or_external(auth_service: AuthService) -> Callable:
+def has_realm_role(auth_service: AuthService, required_role: str) -> Callable:
     """
-    Create an internal/external access check dependency for the given AuthService.
+    Create a realm-role check dependency for the given AuthService.
 
     Args:
         auth_service: Configured AuthService instance
+        required_role: The realm role name that the user must have
 
     Returns:
         Async dependency function
     """
-    return AuthDependencies(auth_service).require_internal_or_external()
+    return AuthDependencies(auth_service).has_realm_role(required_role)
+
+
+def has_any_realm_role(auth_service: AuthService, allowed_roles: list[str]) -> Callable:
+    """
+    Create a multi-realm-role check dependency for the given AuthService.
+
+    Args:
+        auth_service: Configured AuthService instance
+        allowed_roles: List of acceptable realm role names
+
+    Returns:
+        Async dependency function
+    """
+    return AuthDependencies(auth_service).has_any_realm_role(allowed_roles)
