@@ -20,27 +20,83 @@ class AuthService:
 
     def __init__(
         self,
-        jwks_url: str,
-        audience: str,
+        jwks_url: Optional[str] = None,
+        audience: Optional[str] = None,
         algorithms: Optional[list[str]] = None,
         custom_headers: Optional[Dict[str, str]] = None,
+        dev_mode: bool = False,
+        dev_users: Optional[Dict[str, Dict[str, Any]]] = None,
     ):
         """
         Initialize the authentication service.
 
         Args:
-            jwks_url: URL to the JWKS endpoint (e.g., Keycloak certs endpoint)
-            audience: Expected audience claim in the JWT token
+            jwks_url: URL to the JWKS endpoint (e.g., Keycloak certs endpoint).
+                Required unless dev_mode is True.
+            audience: Expected audience claim in the JWT token. Required unless
+                dev_mode is True (defaults to "dev-client" in dev mode).
             algorithms: List of allowed signing algorithms (default: ["RS256"])
             custom_headers: Optional custom headers for JWKS client requests
+            dev_mode: If True, JWT signatures are NOT verified. Instead, the
+                bearer token is looked up in dev_users to resolve a stub user.
+                NEVER enable this in production.
+            dev_users: Mapping of bearer-token string -> stub user spec. Each
+                spec may contain "user_id"/"sub", "username", "email", "roles"
+                (a list), and an optional "claims" dict for extra/raw claims.
+                Only used when dev_mode is True. If omitted/empty, token
+                verification is skipped entirely and any token (including none)
+                resolves to a default stub user.
         """
         self.jwks_url = jwks_url
         self.audience = audience
         self.algorithms = algorithms or ["RS256"]
+        self.dev_mode = dev_mode
+
+        if dev_mode:
+            # In dev mode we short-circuit JWKS verification entirely.
+            self.audience = audience or "dev-client"
+            self.dev_users = self._build_dev_users(dev_users or {})
+            self.jwks_client = None
+            logger.warning(
+                "AuthService initialized in DEV MODE — JWT signatures are NOT "
+                "verified. Do not use this in production."
+            )
+            return
+
+        if not jwks_url or not audience:
+            raise ValueError(
+                "jwks_url and audience are required when dev_mode is False"
+            )
 
         # Initialize PyJWKClient with optional custom headers
         headers = custom_headers or {"User-agent": "newsquawk-service"}
         self.jwks_client = PyJWKClient(jwks_url, headers=headers)
+
+    def _build_dev_users(
+        self, dev_users: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Resolve each stub user spec into Keycloak-shaped token claims."""
+        return {
+            token: self._spec_to_claims(spec) for token, spec in dev_users.items()
+        }
+
+    def _spec_to_claims(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build decoded-token claims from a stub user spec.
+
+        Roles are nested under resource_access[audience][roles] so that
+        extract_roles works identically to a real Keycloak token.
+        """
+        roles = spec.get("roles", [])
+        claims: Dict[str, Any] = {
+            "sub": spec.get("user_id") or spec.get("sub") or spec.get("username", "dev-user"),
+            "preferred_username": spec.get("username"),
+            "email": spec.get("email"),
+            "resource_access": {self.audience: {"roles": roles}},
+        }
+        # Allow arbitrary extra/raw claims to be merged in or override defaults.
+        claims.update(spec.get("claims", {}))
+        return claims
 
     async def verify_and_decode_token(self, token: str) -> Dict[str, Any]:
         """
@@ -61,6 +117,23 @@ class AuthService:
         Raises:
             HTTPException: 401 if token is invalid, expired, or verification fails
         """
+        if self.dev_mode:
+            logger.warning(
+                "DEV MODE auth: resolving stub user from token without "
+                "signature verification"
+            )
+            # No registry configured -> skip verification, accept any token
+            # (including none) and return a default stub user.
+            if not self.dev_users:
+                return self._spec_to_claims({})
+            if token in self.dev_users:
+                return self.dev_users[token]
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unknown dev user token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
         try:
             # Get the signing key from the JWKS endpoint
             signing_key = self.jwks_client.get_signing_key_from_jwt(token)

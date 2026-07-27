@@ -99,6 +99,64 @@ async def content_route(
     return {"roles": user_roles}
 ```
 
+## Dev Mode (stub users, no Keycloak)
+
+For local development and tests you can run without a real Keycloak/JWKS
+endpoint. In dev mode, **JWT signatures are not verified** — instead the bearer
+token string is used to look up a stub user you register up front.
+
+```python
+from newsquawk_auth import AuthService, AuthDependencies
+
+auth_service = AuthService(
+    dev_mode=True,
+    dev_users={
+        # bearer token string -> stub user spec
+        "admin-token": {
+            "username": "alice",
+            "email": "alice@example.com",
+            "roles": ["admin", "access-internal"],
+        },
+        "external-token": {
+            "username": "bob",
+            "roles": ["access-external"],
+        },
+    },
+)
+auth_deps = AuthDependencies(auth_service)
+```
+
+Routes and dependencies are used exactly as in production — nothing else
+changes. Call a protected endpoint with the stub token as a normal bearer
+token:
+
+```bash
+curl -H "Authorization: Bearer admin-token" http://localhost:8000/protected
+```
+
+Each stub user spec accepts:
+
+- `roles` — list of role strings (nested under `resource_access[audience]` so
+  `has_role` / `has_any_role` work identically to a real token)
+- `username` — maps to `preferred_username`
+- `email`
+- `user_id` / `sub` — defaults to `username` if omitted
+- `claims` — optional dict of extra/raw claims merged into the token data
+
+In dev mode `jwks_url` is not needed and `audience` defaults to `"dev-client"`.
+When `dev_users` is provided, an unrecognised token returns `401`.
+
+If you omit `dev_users` entirely, token verification is **skipped completely** —
+any token (or none) resolves to a default stub user (`sub="dev-user"`, no
+roles). Handy for the fastest possible local setup:
+
+```python
+auth_service = AuthService(dev_mode=True)  # accept anything as "dev-user"
+```
+
+> ⚠️ **Never enable `dev_mode` in production.** Gate it behind an environment
+> flag in the consuming service, e.g. `dev_mode=settings.auth_dev_mode`.
+
 ## API Reference
 
 ### AuthService
