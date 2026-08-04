@@ -11,5 +11,6 @@ setup(
         "fastapi>=0.100.0",
         "PyJWT>=2.8.0",
         "cryptography>=41.0.0",
+        "httpx>=0.24.0",
     ],
 )

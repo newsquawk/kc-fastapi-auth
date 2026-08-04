@@ -345,3 +345,41 @@ class AuthService:
             Email string or None if not found
         """
         return token_data.get("email")
+
+    def extract_client_id(self, token_data: Dict[str, Any]) -> Optional[str]:
+        """
+        Extract the calling client's ID from the token.
+
+        For a service-account (client credentials) token this is the client
+        that authenticated. Reads the ``azp`` (authorized party) claim first,
+        falling back to ``clientId``/``client_id`` for setups that expose it.
+
+        Args:
+            token_data: Decoded JWT token claims
+
+        Returns:
+            Client ID string or None if not present
+        """
+        return (
+            token_data.get("azp")
+            or token_data.get("clientId")
+            or token_data.get("client_id")
+        )
+
+    def is_service_account(self, token_data: Dict[str, Any]) -> bool:
+        """
+        Determine whether the token belongs to a Keycloak service account.
+
+        Keycloak issues client-credentials tokens with a
+        ``preferred_username`` of the form ``service-account-<client-id>``.
+        This is the reliable marker used here; the ``azp`` claim alone is not
+        sufficient because interactive-user tokens also carry it.
+
+        Args:
+            token_data: Decoded JWT token claims
+
+        Returns:
+            True if the token represents a service account, False otherwise
+        """
+        username = token_data.get("preferred_username") or ""
+        return username.startswith("service-account-")

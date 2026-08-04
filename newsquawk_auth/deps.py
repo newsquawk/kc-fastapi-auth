@@ -73,6 +73,16 @@ class CurrentUser:
         return self._auth_service.extract_client_roles(self._token_data, client)
 
     @property
+    def client_id(self) -> Optional[str]:
+        """Calling client's ID (azp claim) — set for service-account tokens."""
+        return self._auth_service.extract_client_id(self._token_data)
+
+    @property
+    def is_service_account(self) -> bool:
+        """Whether this token belongs to a Keycloak service account."""
+        return self._auth_service.is_service_account(self._token_data)
+
+    @property
     def token_data(self) -> Dict[str, Any]:
         """Raw decoded token data for custom claim access."""
         return self._token_data
@@ -301,6 +311,52 @@ class AuthDependencies:
 
         return _check_realm_roles
 
+    def require_service_account(
+        self, client_id: Optional[str] = None
+    ) -> Callable:
+        """
+        Create a dependency that requires a Keycloak service-account token.
+
+        This guards service-to-service endpoints so that only machine callers
+        (client-credentials tokens) may reach them. Role checks
+        (:meth:`has_realm_role`/:meth:`has_client_role`) remain the primary way
+        to authorize *which* service account may do *what*; use this to also
+        assert the caller is a service account and, optionally, a specific
+        client.
+
+        Args:
+            client_id: If given, the token's client (azp) must equal this
+                value. If None, any valid service-account token is accepted.
+
+        Returns:
+            Async dependency function that returns the calling client's ID
+
+        Raises:
+            HTTPException: 403 if the token is not a service account, or is a
+                service account for a different client than required
+        """
+        auth_service = self.auth_service
+        _get_token_data = self.get_token_data()
+
+        async def _check_service_account(
+            token_data: Annotated[Dict[str, Any], Depends(_get_token_data)],
+        ) -> Optional[str]:
+            """Check the token is a service account (optionally a given client)."""
+            if not auth_service.is_service_account(token_data):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Service account credentials required",
+                )
+            token_client = auth_service.extract_client_id(token_data)
+            if client_id is not None and token_client != client_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Service account for client '{client_id}' required",
+                )
+            return token_client
+
+        return _check_service_account
+
 
 # Convenience functions for backward compatibility and simpler usage
 def get_token_data(auth_service: AuthService) -> Callable:
@@ -389,3 +445,19 @@ def has_any_realm_role(auth_service: AuthService, allowed_roles: list[str]) -> C
         Async dependency function
     """
     return AuthDependencies(auth_service).has_any_realm_role(allowed_roles)
+
+
+def require_service_account(
+    auth_service: AuthService, client_id: Optional[str] = None
+) -> Callable:
+    """
+    Create a service-account guard dependency for the given AuthService.
+
+    Args:
+        auth_service: Configured AuthService instance
+        client_id: If given, restrict to this specific calling client (azp)
+
+    Returns:
+        Async dependency function
+    """
+    return AuthDependencies(auth_service).require_service_account(client_id)

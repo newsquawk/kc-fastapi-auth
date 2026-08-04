@@ -207,6 +207,13 @@ auth_service = AuthService(jwks_url=settings.keycloak_jwks_url)
 > `verify_aud=False` would instead reject every token that carries an `aud`
 > claim (which Keycloak tokens normally do). The library handles this for you.
 
+## Service-to-service auth (Keycloak service accounts)
+
+For machine-to-machine calls — one backend app authenticating to another using
+Keycloak service accounts (client-credentials grant), token acquisition/caching
+on the caller, and service-account authorization on the receiver — see
+**[docs/service-accounts.md](docs/service-accounts.md)**.
+
 ## API Reference
 
 ### AuthService
@@ -265,3 +272,7 @@ These functions accept an AuthService instance and return configured dependencie
 - `has_any_client_role(auth_service, client, roles)` - Create multi-client-role check dependency
 - `has_realm_role(auth_service, role)` - Create realm-role check dependency
 - `has_any_realm_role(auth_service, roles)` - Create multi-realm-role check dependency
+
+> **Service accounts:** `require_service_account`, `ServiceAccountTokenProvider`,
+> and the related `AuthService`/`CurrentUser` members are documented in
+> [docs/service-accounts.md](docs/service-accounts.md).
