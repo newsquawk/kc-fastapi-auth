@@ -1,21 +1,58 @@
 """Authentication service using JWT and JWKS for token validation."""
 
+import asyncio
 import logging
+import time
 from typing import Any, Dict, Optional
 
+import httpx
 import jwt
-from jwt import PyJWKClient
+from jwt import PyJWK, PyJWKSet
 from fastapi import HTTPException, status
 
 logger = logging.getLogger(__name__)
+
+# Default lifespan (seconds) of the cached JWKS before a refresh is triggered.
+# Mirrors PyJWKClient's historical default of 5 minutes.
+DEFAULT_JWKS_CACHE_LIFESPAN = 300
+
+# Default timeout (seconds) for the async JWKS HTTP fetch.
+DEFAULT_JWKS_TIMEOUT = 30.0
+
+
+class JWKSUnavailableError(Exception):
+    """
+    Raised when the JWKS endpoint cannot be reached or returns unusable data.
+
+    This signals an upstream/server-side failure (the identity provider is down,
+    timing out, or returning garbage) as opposed to a client presenting a bad
+    token. It is mapped to an HTTP 503 by :meth:`AuthService.verify_and_decode_token`
+    so callers can tell "we couldn't validate right now" apart from "your token
+    is invalid" (401).
+    """
+
+# Shared symmetric secret used by the stub (fake-Keycloak) flow. Both the
+# issuer (:class:`newsquawk_auth.stub.StubIdentityProvider`) and the validator
+# (:class:`AuthService` in stub mode) default to this so zero-config local dev
+# works out of the box. Override it in both places for anything beyond a laptop.
+# It is deliberately obvious that this is not a production secret.
+DEFAULT_STUB_SECRET = "insecure-stub-secret-do-not-use-in-production"
+
+# Algorithm used for stub tokens. Kept strictly separate from the production
+# RS256/JWKS path so a stub HS256 token can never be accepted by a real
+# validator (and vice versa), avoiding algorithm-confusion attacks.
+STUB_ALGORITHM = "HS256"
 
 
 class AuthService:
     """
     Service class for handling JWT authentication with remote JWKS certificates.
 
-    This service validates JWT tokens using PyJWKClient to fetch and cache
-    signing keys from a remote JWKS endpoint (e.g., Keycloak).
+    This service validates JWT tokens by fetching signing keys from a remote
+    JWKS endpoint (e.g., Keycloak). The fetch is performed asynchronously with
+    httpx and the resulting keys are cached per instance, so token validation
+    never blocks the event loop. Concurrent cache misses are coalesced into a
+    single fetch via an ``asyncio.Lock`` (single-flight).
     """
 
     def __init__(
@@ -24,51 +61,84 @@ class AuthService:
         audience: Optional[str] = None,
         algorithms: Optional[list[str]] = None,
         custom_headers: Optional[Dict[str, str]] = None,
+        stub_mode: bool = False,
+        stub_secret: Optional[str] = None,
         dev_mode: bool = False,
-        dev_users: Optional[Dict[str, Dict[str, Any]]] = None,
+        jwks_cache_lifespan: int = DEFAULT_JWKS_CACHE_LIFESPAN,
+        jwks_timeout: float = DEFAULT_JWKS_TIMEOUT,
     ):
         """
         Initialize the authentication service.
 
         Args:
             jwks_url: URL to the JWKS endpoint (e.g., Keycloak certs endpoint).
-                Required unless dev_mode is True.
+                Required unless stub_mode is True.
             audience: Expected audience (aud) claim in the JWT token. Optional.
                 When set, the token's aud claim must be present and match. When
-                None (and not in dev mode), audience validation is disabled
-                entirely — signature and expiry are still verified. Defaults to
-                "dev-client" in dev mode.
-            algorithms: List of allowed signing algorithms (default: ["RS256"])
+                None, audience validation is disabled entirely — signature and
+                expiry are still verified. Applies in both real and stub mode.
+            algorithms: List of allowed signing algorithms (default: ["RS256"]).
+                Ignored in stub mode, which always uses HS256.
             custom_headers: Optional custom headers for JWKS client requests
-            dev_mode: If True, JWT signatures are NOT verified. Instead, the
-                bearer token is looked up in dev_users to resolve a stub user.
-                NEVER enable this in production.
-            dev_users: Mapping of bearer-token string -> stub user spec. Each
-                spec may contain "user_id"/"sub", "username", "email",
-                "realm_roles" (a list), "client_roles" (a dict of
-                client -> list of roles), and an optional "claims" dict for
-                extra/raw claims. Only used when dev_mode is True. If
-                omitted/empty, token verification is skipped entirely and any
-                token (including none) resolves to a default stub user.
+            stub_mode: If True, run against the stub (fake-Keycloak) flow:
+                tokens are verified as real HS256 JWTs signed with a shared
+                symmetric secret (see :data:`DEFAULT_STUB_SECRET`) rather than
+                against a remote JWKS endpoint. Signature and expiry ARE
+                verified — only the trust root differs. Tokens are minted by
+                :class:`newsquawk_auth.stub.StubIdentityProvider`. NEVER enable
+                this in production.
+            stub_secret: Shared HS256 secret used to verify stub tokens. Must
+                match the secret the issuer signs with. Defaults to
+                :data:`DEFAULT_STUB_SECRET`. Only used when stub_mode is True.
+            dev_mode: Deprecated alias for ``stub_mode``, kept for backward
+                compatibility. Note the mechanism has changed: stub tokens are
+                now signature-verified HS256 JWTs, not looked up in a dict.
+            jwks_cache_lifespan: Seconds to cache the fetched JWKS before a
+                refresh is triggered on the next validation (default 300).
+                Ignored in stub mode.
+            jwks_timeout: Timeout in seconds for the async JWKS HTTP fetch
+                (default 30). Ignored in stub mode.
         """
         self.jwks_url = jwks_url
         self.audience = audience
         self.algorithms = algorithms or ["RS256"]
-        self.dev_mode = dev_mode
+        self.jwks_cache_lifespan = jwks_cache_lifespan
+        self.jwks_timeout = jwks_timeout
 
-        if dev_mode:
-            # In dev mode we short-circuit JWKS verification entirely.
-            self.audience = audience or "dev-client"
-            self.dev_users = self._build_dev_users(dev_users or {})
-            self.jwks_client = None
+        if dev_mode and not stub_mode:
             logger.warning(
-                "AuthService initialized in DEV MODE — JWT signatures are NOT "
-                "verified. Do not use this in production."
+                "AuthService 'dev_mode' is deprecated; use 'stub_mode'. The "
+                "stub mechanism now verifies HS256-signed JWTs instead of "
+                "looking tokens up in a dict."
+            )
+            stub_mode = True
+        self.stub_mode = stub_mode
+        # Backwards-compatible attribute some callers may still read.
+        self.dev_mode = stub_mode
+
+        # JWKS cache state (production mode only). Populated lazily on the first
+        # validation and refreshed once the lifespan expires. Guarded by an
+        # asyncio.Lock so concurrent requests that miss the cache trigger a
+        # single fetch (single-flight) rather than a thundering herd.
+        self._jwks_headers = custom_headers or {"User-agent": "newsquawk-service"}
+        self._jwks_by_kid: Optional[Dict[str, PyJWK]] = None
+        self._jwks_fetched_at: float = 0.0
+        self._jwks_lock = asyncio.Lock()
+
+        if stub_mode:
+            # Stub mode: verify HS256 tokens with a shared secret instead of
+            # fetching signing keys from a JWKS endpoint. No JWKS fetch.
+            self.stub_secret = stub_secret or DEFAULT_STUB_SECRET
+            self.algorithms = [STUB_ALGORITHM]
+            logger.warning(
+                "AuthService initialized in STUB MODE — tokens are verified "
+                "against a shared HS256 secret, NOT Keycloak. Do not use this "
+                "in production."
             )
             return
 
         if not jwks_url:
-            raise ValueError("jwks_url is required when dev_mode is False")
+            raise ValueError("jwks_url is required when stub_mode is False")
 
         if not audience:
             logger.warning(
@@ -77,58 +147,18 @@ class AuthService:
                 "verified."
             )
 
-        # Initialize PyJWKClient with optional custom headers
-        headers = custom_headers or {"User-agent": "newsquawk-service"}
-        self.jwks_client = PyJWKClient(jwks_url, headers=headers)
-
-    def _build_dev_users(
-        self, dev_users: Dict[str, Dict[str, Any]]
-    ) -> Dict[str, Dict[str, Any]]:
-        """Resolve each stub user spec into Keycloak-shaped token claims."""
-        return {
-            token: self._spec_to_claims(spec) for token, spec in dev_users.items()
-        }
-
-    def _spec_to_claims(self, spec: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Build decoded-token claims from a stub user spec.
-
-        Realm roles are nested under realm_access[roles] and client roles under
-        resource_access[client][roles], mirroring a real Keycloak token so the
-        extract_* / verify_* methods work identically.
-
-        Spec keys:
-            user_id / sub, username, email
-            realm_roles: list[str] -> realm_access.roles
-            client_roles: dict[client -> list[str]] -> resource_access[client].roles
-            claims: dict of extra/raw claims merged in last
-        """
-        claims: Dict[str, Any] = {
-            "sub": spec.get("user_id") or spec.get("sub") or spec.get("username", "dev-user"),
-            "preferred_username": spec.get("username"),
-            "email": spec.get("email"),
-        }
-        realm_roles = spec.get("realm_roles")
-        if realm_roles:
-            claims["realm_access"] = {"roles": list(realm_roles)}
-        client_roles = spec.get("client_roles")
-        if client_roles:
-            claims["resource_access"] = {
-                client: {"roles": list(roles)} for client, roles in client_roles.items()
-            }
-        # Allow arbitrary extra/raw claims to be merged in or override defaults.
-        claims.update(spec.get("claims", {}))
-        return claims
-
     async def verify_and_decode_token(self, token: str) -> Dict[str, Any]:
         """
-        Verify and decode a JWT token using remote JWKS certificates.
+        Verify and decode a JWT token.
 
-        This method:
-        1. Fetches the signing key from the JWKS endpoint
-        2. Verifies the token signature
-        3. Validates the audience and expiration
-        4. Returns the decoded token claims
+        In production this:
+        1. Fetches the signing key from the JWKS endpoint (async, off the event
+           loop's critical path — the HTTP fetch is awaited via httpx and the
+           result is cached, so concurrent requests are not blocked)
+        2. Verifies the RS256 signature, audience and expiration
+
+        In stub mode the signing key is the shared HS256 secret instead of a
+        JWKS key; signature, audience and expiration are still verified.
 
         Args:
             token: The JWT token string to verify and decode
@@ -139,34 +169,27 @@ class AuthService:
         Raises:
             HTTPException: 401 if token is invalid, expired, or verification fails
         """
-        if self.dev_mode:
-            logger.warning(
-                "DEV MODE auth: resolving stub user from token without "
-                "signature verification"
-            )
-            # No registry configured -> skip verification, accept any token
-            # (including none) and return a default stub user.
-            if not self.dev_users:
-                return self._spec_to_claims({})
-            if token in self.dev_users:
-                return self.dev_users[token]
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unknown dev user token",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
         try:
-            # Get the signing key from the JWKS endpoint
-            signing_key = self.jwks_client.get_signing_key_from_jwt(token)
+            if self.stub_mode:
+                # Stub mode: verify the HS256 signature with the shared secret.
+                key: Any = self.stub_secret
+                algorithms = self.algorithms
+            else:
+                # Resolve the signing key for this token's `kid` from the JWKS,
+                # awaiting an async fetch on a cache miss so the event loop stays
+                # free for other requests.
+                unverified_header = jwt.get_unverified_header(token)
+                kid = unverified_header.get("kid")
+                key = (await self._get_signing_key(kid)).key
+                algorithms = self.algorithms
 
             # Decode and verify the token. Audience is validated only when an
             # audience was configured; otherwise verify_aud is disabled so that
             # tokens carrying an aud claim are not rejected outright.
             decoded_token = jwt.decode(
                 token,
-                signing_key.key,
-                algorithms=self.algorithms,
+                key,
+                algorithms=algorithms,
                 audience=self.audience,
                 options={
                     "verify_exp": True,
@@ -197,6 +220,14 @@ class AuthService:
                 detail="Invalid authentication token",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        except JWKSUnavailableError as e:
+            # Upstream identity provider is unreachable/misbehaving. This is not
+            # the client's fault, so surface a 503 (retryable) rather than a 401.
+            logger.error(f"JWKS endpoint unavailable: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication service temporarily unavailable",
+            )
         except Exception as e:
             logger.error(f"Token validation error: {e}")
             raise HTTPException(
@@ -204,6 +235,92 @@ class AuthService:
                 detail="Authentication failed",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+
+    def _cached_signing_key(self, kid: Optional[str]) -> Optional[PyJWK]:
+        """
+        Return the cached signing key for ``kid`` if the cache is warm and valid.
+
+        Returns None when the cache is empty, expired, or does not contain the
+        requested ``kid`` (e.g. after a key rotation), signalling the caller to
+        refresh under the lock.
+        """
+        if self._jwks_by_kid is None:
+            return None
+        if time.monotonic() > self._jwks_fetched_at + self.jwks_cache_lifespan:
+            return None
+        return self._jwks_by_kid.get(kid)
+
+    async def _get_signing_key(self, kid: Optional[str]) -> PyJWK:
+        """
+        Resolve the JWKS signing key for a token's ``kid``, fetching if needed.
+
+        Uses a double-checked lock so that only one coroutine performs the async
+        JWKS fetch on a cache miss (single-flight); the rest await the lock and
+        reuse the freshly cached result. The HTTP fetch is awaited via httpx, so
+        the event loop is never blocked.
+
+        Args:
+            kid: The ``kid`` (key id) from the token's unverified header.
+
+        Returns:
+            The matching PyJWK signing key.
+
+        Raises:
+            jwt.PyJWKClientError: If no key matching ``kid`` exists even after a
+                refresh (mapped to a 401 by the caller).
+        """
+        key = self._cached_signing_key(kid)
+        if key is not None:
+            return key
+
+        async with self._jwks_lock:
+            # Re-check: another coroutine may have refreshed while we waited.
+            key = self._cached_signing_key(kid)
+            if key is not None:
+                return key
+
+            await self._refresh_jwks()
+
+            key = (self._jwks_by_kid or {}).get(kid)
+            if key is None:
+                raise jwt.PyJWKClientError(
+                    f'Unable to find a signing key that matches: "{kid}"'
+                )
+            return key
+
+    async def _refresh_jwks(self) -> None:
+        """
+        Fetch the JWKS from ``jwks_url`` and rebuild the ``kid`` -> key cache.
+
+        Called only while holding ``self._jwks_lock``. On a network/parse error
+        a :class:`JWKSUnavailableError` is raised and the existing cache is left
+        untouched — a transient failure never wipes a previously good cache, and
+        the caller maps it to an HTTP 503 rather than a 401.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self.jwks_timeout) as client:
+                response = await client.get(self.jwks_url, headers=self._jwks_headers)
+                response.raise_for_status()
+                data = response.json()
+            jwk_set = PyJWKSet.from_dict(data)
+        except (httpx.HTTPError, ValueError, jwt.PyJWTError) as e:
+            # Network failure, timeout, non-2xx response, invalid JSON, or an
+            # unusable key set — all upstream problems, surfaced as 503.
+            raise JWKSUnavailableError(
+                f"Failed to fetch JWKS from {self.jwks_url}: {e}"
+            ) from e
+
+        self._jwks_by_kid = {
+            jwk.key_id: jwk
+            for jwk in jwk_set.keys
+            if jwk.key_id and jwk.public_key_use in ("sig", None)
+        }
+        self._jwks_fetched_at = time.monotonic()
+        logger.debug(
+            "Refreshed JWKS from %s (%d signing key(s))",
+            self.jwks_url,
+            len(self._jwks_by_kid),
+        )
 
     def extract_client_roles(self, token_data: Dict[str, Any], client: str) -> list[str]:
         """

@@ -1,6 +1,10 @@
 """Newsquawk authentication package for JWT/JWKS token validation."""
 
-from newsquawk_auth.service import AuthService
+from newsquawk_auth.service import (
+    AuthService,
+    DEFAULT_STUB_SECRET,
+    JWKSUnavailableError,
+)
 from newsquawk_auth.client import (
     ServiceAccountTokenProvider,
     ServiceAccountAuth,
@@ -21,10 +25,17 @@ from newsquawk_auth.deps import (
     require_service_account,
 )
 
-__version__ = "0.1.1"
+# Stub (fake-Keycloak) helpers live in newsquawk_auth.stub and require the
+# optional "stub" extra (bcrypt, PyYAML). They are intentionally NOT imported
+# here so the core install stays lean:
+#     from newsquawk_auth.stub import StubIdentityProvider, build_stub_login_router
+
+__version__ = "0.3.0"
 
 __all__ = [
     "AuthService",
+    "DEFAULT_STUB_SECRET",
+    "JWKSUnavailableError",
     "AuthDependencies",
     # Service-account (client-credentials) caller-side helpers
     "ServiceAccountTokenProvider",

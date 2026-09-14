@@ -1,0 +1,58 @@
+# Stub authentication users.
+#
+# This is the bundled SAMPLE data used by StubIdentityProvider when no data
+# file is supplied. Copy it, point the provider at your own copy, and edit as
+# needed. For local development only — never use these credentials anywhere
+# real.
+#
+# Passwords must be bcrypt hashes. Plaintext passwords are not supported.
+#
+# To generate a bcrypt password hash:
+#
+#   Python (with bcrypt installed):
+#     import bcrypt
+#     password = b"your-password-here"
+#     hashed = bcrypt.hashpw(password, bcrypt.gensalt(rounds=12))
+#     print(hashed.decode("ascii"))
+#
+#   Command line (with htpasswd from apache2-utils):
+#     htpasswd -bnBC 12 "" "your-password-here" | tr -d ':\n' | sed 's/$2y/$2b/'
+#
+# The server verifies hashes using bcrypt.checkpw().
+#
+# `roles` maps a role name to the list of user ids that hold it. Each id listed
+# under a role is granted that realm role (nested under realm_access.roles in
+# the issued token), so has_realm_role()/has_any_realm_role() work unchanged.
+users:
+- user: jason.earl@newsquawk.com
+  id: 42770e7c-d0f5-45a0-b3e1-25082abcae70
+  password_hash: $2b$12$zVjyZy7XhocCgp1jxCQUCuPdwkCPlXkj5l5GGhEZ6/bfPDdG8OaoG
+- user: dev@newsquawk.com
+  id: e56d413b-2fae-456a-b195-affb05f6dabe
+  password_hash: $2b$12$QXwQhdf.DZNE.74ZZbHy/OEI6veF7j2muc.JABOZLte3nzUojOHrm
+- user: desk@newsquawk.com
+  id: c49a421f-abb3-4d38-af7c-79b6c423bab2
+  password_hash: $2b$12$8LIObJM4UTGSgpmHh3fsoO0fpgH8D8IUxP2TEz0snsAdnNE3775nW
+- user: desk
+  id: 53054139-e449-4047-b8e7-1850cb71f019
+  password_hash: $2b$12$LjhAGOKXQMXSv3nXlTjm0u6SJq90aR23wRy2VwWhOn/WeZpK46CMC
+- user: sales@newsquawk.com
+  id: d02bcd39-2f3a-4804-acc5-03d73a4ea8ae
+  password_hash: $2b$12$uc7DE5enemKgI0HoMsTbbOsF.nXXru3dKJ9UIpEfW1SKTc3r2cftu
+- user: listen@example.com
+  id: 3df76933-df02-4bf7-bb4a-28d8ce46631f
+  password_hash: $2b$12$Ewu5tAsr5s4BtAAA0WgPK.W2qgxN/s9ao0uEAu7T9TB79Cu5d2Wsy
+roles:
+  view:
+  - 3df76933-df02-4bf7-bb4a-28d8ce46631f
+  - c49a421f-abb3-4d38-af7c-79b6c423bab2
+  - 53054139-e449-4047-b8e7-1850cb71f019
+  - d02bcd39-2f3a-4804-acc5-03d73a4ea8ae
+  - 42770e7c-d0f5-45a0-b3e1-25082abcae70
+  - e56d413b-2fae-456a-b195-affb05f6dabe
+  admin:
+  - c49a421f-abb3-4d38-af7c-79b6c423bab2
+  - 53054139-e449-4047-b8e7-1850cb71f019
+  - d02bcd39-2f3a-4804-acc5-03d73a4ea8ae
+  - 42770e7c-d0f5-45a0-b3e1-25082abcae70
+  - e56d413b-2fae-456a-b195-affb05f6dabe
