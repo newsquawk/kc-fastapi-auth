@@ -249,7 +249,23 @@ auth_service = AuthService(
     jwks_url=settings.keycloak_jwks_url,
     audience="my-api",
     jwks_cache_lifespan=300,  # seconds to cache keys before refreshing
-    jwks_timeout=30,          # seconds for the JWKS HTTP fetch
+    jwks_timeout=5,           # seconds for the JWKS HTTP fetch (applied to all phases)
+)
+```
+
+`jwks_timeout` defaults to a tight `httpx.Timeout(5.0, connect=2.0)` (connect
+2 s, read 5 s). Because the fetch runs inside the single-flight lock, a slow
+endpoint would otherwise stall every concurrent cache-miss validation until it
+times out, so the default is deliberately short. Pass a plain number to set all
+phases at once, or an `httpx.Timeout` for finer control:
+
+```python
+import httpx
+
+auth_service = AuthService(
+    jwks_url=settings.keycloak_jwks_url,
+    audience="my-api",
+    jwks_timeout=httpx.Timeout(5.0, connect=2.0, read=5.0),
 )
 ```
 

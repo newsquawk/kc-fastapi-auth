@@ -30,7 +30,7 @@ from newsquawk_auth.deps import (
 # here so the core install stays lean:
 #     from newsquawk_auth.stub import StubIdentityProvider, build_stub_login_router
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "AuthService",

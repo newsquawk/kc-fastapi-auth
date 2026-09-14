@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import httpx
 import jwt
@@ -16,8 +16,13 @@ logger = logging.getLogger(__name__)
 # Mirrors PyJWKClient's historical default of 5 minutes.
 DEFAULT_JWKS_CACHE_LIFESPAN = 300
 
-# Default timeout (seconds) for the async JWKS HTTP fetch.
-DEFAULT_JWKS_TIMEOUT = 30.0
+# Default timeout for the async JWKS HTTP fetch. Deliberately tight: the fetch
+# runs inside the single-flight lock, so a hung endpoint would otherwise stall
+# every concurrent cache-miss validation until it fires. A fast connect timeout
+# fails quickly on a dead endpoint; the read timeout bounds a slow response.
+# Callers can override with a plain float (applied to all phases) or their own
+# httpx.Timeout for finer control.
+DEFAULT_JWKS_TIMEOUT = httpx.Timeout(5.0, connect=2.0)
 
 
 class JWKSUnavailableError(Exception):
@@ -65,7 +70,7 @@ class AuthService:
         stub_secret: Optional[str] = None,
         dev_mode: bool = False,
         jwks_cache_lifespan: int = DEFAULT_JWKS_CACHE_LIFESPAN,
-        jwks_timeout: float = DEFAULT_JWKS_TIMEOUT,
+        jwks_timeout: Union[float, httpx.Timeout] = DEFAULT_JWKS_TIMEOUT,
     ):
         """
         Initialize the authentication service.
@@ -96,8 +101,12 @@ class AuthService:
             jwks_cache_lifespan: Seconds to cache the fetched JWKS before a
                 refresh is triggered on the next validation (default 300).
                 Ignored in stub mode.
-            jwks_timeout: Timeout in seconds for the async JWKS HTTP fetch
-                (default 30). Ignored in stub mode.
+            jwks_timeout: Timeout for the async JWKS HTTP fetch. A plain number
+                is applied to all httpx phases (connect/read/write/pool); pass an
+                ``httpx.Timeout`` for finer control. Defaults to a tight
+                connect=2s / read=5s so a hung endpoint fails fast rather than
+                stalling concurrent validations behind the single-flight lock.
+                Ignored in stub mode.
         """
         self.jwks_url = jwks_url
         self.audience = audience
