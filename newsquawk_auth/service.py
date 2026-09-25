@@ -223,7 +223,11 @@ class AuthService:
                 headers={"WWW-Authenticate": "Bearer"},
             )
         except jwt.InvalidTokenError as e:
-            logger.error(f"Invalid token: {e}")
+            # A malformed or audience-less token is the caller's to fix, as an
+            # expired one is; the 401 tells them. As an error, every such
+            # request became a Sentry issue event in services using Sentry's
+            # logging integration.
+            logger.warning(f"Invalid token: {e}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid authentication token",
